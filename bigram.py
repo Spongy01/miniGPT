@@ -6,12 +6,12 @@ torch.manual_seed(1337)
 
 batch_size = 32
 block_size = 8
-max_iters = 30000
+max_iters = 10000
 eval_interval = 300
 learning_rate = 1e-2
 device = 'cpu'
 eval_iters = 200
-
+n_embd = 32
 
 
 
@@ -69,13 +69,18 @@ class BigramLanguageModel(nn.Module):
   def __init__(self, vocab_size):
     super().__init__()
     # each token directly reads off the logits for the next token from a lookup table
-    self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+    self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+    self.positional_embedding_table = nn.Embedding(block_size, n_embd)
+    self.head = nn.Linear(n_embd, vocab_size)
 
   def forward(self, idx, targets=None):
+    B, T = idx.shape
 
     # idx and targets are both (B,T) tensor of integers
-    logits = self.token_embedding_table(idx) # (B,T,C)
-
+    token_embeddings = self.token_embedding_table(idx) # (B,T,C)
+    pos_embeddings = self.positional_embedding_table(torch.arange(T, device=device)) # T, C
+    embeddings = token_embeddings + pos_embeddings # (B,T,C)
+    logits = self.head(embeddings)
     if targets is None:
         loss = None
     else:
