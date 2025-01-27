@@ -3,17 +3,19 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 torch.manual_seed(1337)
-
-batch_size = 32
-block_size = 8
-max_iters = 10000
-eval_interval = 300
-learning_rate = 1e-3
-device = 'cpu'
+import torch.autograd.profiler as profiler
+batch_size = 64
+block_size = 256
+max_iters = 5000
+eval_interval = 500
+learning_rate = 5e-4
+device = torch.device("mps")
+# device = 'cpu'
 eval_iters = 200
-n_embd = 32
-
-
+n_embd = 256
+n_head = 8
+n_layer = 6
+dropout = 0.2
 
 # read it in to inspect it
 with open('input.txt', 'r', encoding='utf-8') as f:
@@ -33,6 +35,7 @@ decode = lambda l: ''.join([itos[i] for i in l]) # decoder: take a list of integ
 
 
 data = torch.tensor(encode(text), dtype=torch.long)
+data = data.to(device)
 n = int(0.9*len(data)) # first 90% will be train, rest val
 train_data = data[:n]
 val_data = data[n:]
@@ -72,6 +75,8 @@ class Head(nn.Module):
       self.key = nn.Linear(n_embd, head_size)
       self.value = nn.Linear(n_embd, head_size)
       self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+      self.dropout = nn.Dropout(dropout)
+
     
     def forward(self, x):
       B,T,C = x.shape
@@ -82,6 +87,7 @@ class Head(nn.Module):
       weights = q @ k.transpose(-2,-1) * C**-0.5
       weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
       weights = F.softmax(weights, dim=-1) # (B,T,T)
+      weights = self.dropout(weights)
 
       out = weights @ v
 
@@ -93,10 +99,44 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, n_heads, head_size):
       super().__init__()
       self.heads = nn.ModuleList([Head(head_size) for _ in range(n_heads)])
+      self.proj = nn.Linear(n_embd, n_embd)
+      self.dropout = nn.Dropout(dropout)
     
     def forward(self, x):
-       return torch.cat([h(x) for h in self.heads], dim = -1)
+       x =  torch.cat([h(x) for h in self.heads], dim = -1)
+       return self.dropout(self.proj(x))  # (B,T,C)
 
+
+class FeedForward(nn.Module):
+    def __init__(self, n_embd):
+      super().__init__()
+      self.net = nn.Sequential(
+          nn.Linear(n_embd, 4*n_embd),
+          nn.ReLU(),
+          nn.Linear(n_embd*4, n_embd),
+          nn.Dropout(dropout)
+      )
+    
+    def forward(self, x):
+      return self.net(x)
+    
+
+
+class Block(nn.Module):
+   def __init__(self, n_embd, n_head):
+      super().__init__()
+      self.sa_head = MultiHeadAttention(n_head, n_embd//n_head)
+      self.ffwd = FeedForward(n_embd)
+      self.ln1 = nn.LayerNorm(n_embd)
+      self.ln2 = nn.LayerNorm(n_embd)
+      
+   
+   def forward(self, x):
+      x = x + self.sa_head(self.ln1(x))
+      x = x + self.ffwd(self.ln2(x))  # (B,T,C)
+      return x
+
+      
 
 
 class BigramLanguageModel(nn.Module):
@@ -106,8 +146,9 @@ class BigramLanguageModel(nn.Module):
     # each token directly reads off the logits for the next token from a lookup table
     self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
     self.positional_embedding_table = nn.Embedding(block_size, n_embd)
-    self.sa_head = MultiHeadAttention(4, n_embd//4)
+    self.blocks = nn.Sequential( *[Block(n_embd, n_head) for _ in range(n_layer)] )
     self.lm_head = nn.Linear(n_embd, vocab_size)
+    self.ln_f = nn.LayerNorm(n_embd)
 
   def forward(self, idx, targets=None):
     B, T = idx.shape
@@ -116,9 +157,8 @@ class BigramLanguageModel(nn.Module):
     token_embeddings = self.token_embedding_table(idx) # (B,T,C)
     pos_embeddings = self.positional_embedding_table(torch.arange(T, device=device)) # T, C
     embeddings = token_embeddings + pos_embeddings # (B,T,C)
-    
-    x = self.sa_head(embeddings)
-    
+    x = self.blocks(embeddings)
+    x = self.ln_f(x)
     logits = self.lm_head(x)
     if targets is None:
         loss = None
@@ -159,11 +199,12 @@ for iter in range(max_iters):
       print(f'Iter {iter}: train loss {losses["train"]:.4f}, val loss {losses["val"]:.4f}')
 
   xb, yb = get_batch('train')
+
   logits, loss = m(xb,yb)
   optimizer.zero_grad(set_to_none=True)
   loss.backward()
   optimizer.step()
 
 context = torch.zeros((1,1), dtype = torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens = 500)[0].tolist()))
+print(decode(m.generate(context, max_new_tokens = 5000)[0].tolist()))
 
